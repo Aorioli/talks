@@ -1,0 +1,252 @@
+Upgrading Resque the Go way
+25 Apr 2016
+Tags: resque, goworker
+
+Adriano Orioli
+Software engineer, KISI Inc.
+adriano@kisi.io
+https://getkisi.com
+@TheOrioli
+
+* Obligatory company page
+
+.image images/kisi.png 200 _
+
+German ingenuity + American production + Croatian awesomeness
+
+* Let's talk Rails
+
+.image images/rails-logo.svg 200 _
+
+Rails:
+
+- is a monolith
+- is (a) code pureé
+- is a great way to build stuff fast
+
+The recommended way of doing job queues is `ActiveJob` *
+
+*this will bite us in the ass later
+
+* Let's talk Resque
+
+Resque:
+
+- one of multiple ruby answers to job queues
+- works out-of-the-box with ActiveJob (as it should)
+- All it requires is a Redis server somewhere
+
+*Danger!*
+Redis is not secure!
+Google is your friend on this one, it depends on your preferred way of deployment.
+[[https://devcenter.heroku.com/articles/securing-heroku-redis][Heroku published this securing Heroku Redis guide.]]
+It's good to keep that in mind, don't store sensitive info in Redis.
+
+* How Resque works
+
+Taken from the Resque `README.md`.
+
+  class Archive
+    @queue = :file_serve
+
+    def self.perform(repo_id, branch = 'master')
+      repo = Repository.find(repo_id)
+      repo.create_archive(branch)
+    end
+  end
+
+  Resque.enqueue(Archive, 12, "some_branch")
+
+* How Resque works
+
+It pushes the following JSON object into a Redis queue `file_serve`
+
+  {
+    "class": "Archive",
+    "args":[
+      12,
+      "some_branch"
+    }
+  }
+
+Resque workers simply poll the registered queues,
+ popping them if any values exist, and calling the perform method of the class defined
+ under the `class` field in the JSON object
+
+That's it 👍
+
+* Golang and Resque
+
+Obligatory gopher picture
+
+.image images/gopher.png 400 _
+.caption _Gopher_ by [[http://www.reneefrench.com][Renée French]]
+
+* Goworker
+
+.image images/goworker.png
+.caption Tiny logo, tiny footprint is what I always say
+
+[[www.goworker.org]]
+
+  go get github.com/benmanns/goworker
+
+A great package that handles all the dirty parts of connecting to Resque for you.
+
+* Goworker
+
+.code code/goworker_example/goworker_example.go
+
+* Problems we experienced
+
+- Linear jobs
+- Registering jobs
+- Small, fast, and cheap
+- ActiveJob headaches
+
+* Linear jobs
+
+* Linear jobs
+
+We believe in the [[https://en.wikipedia.org/wiki/Unix_philosophy][Unix philosophy]]
+
+*Write*programs*that*do*one*thing*and*do*it*well* - _Malcolm_Douglas_McIlroy_
+
+That translates into a specialized downloader job, specialized parsing job etc.
+
+Which is a not a recommended thing to do with Resque, because you can't really
+ know when a job will finish, if it ever finishes.
+
+But never let people tell you something is not recommended without saying _fuck_it_.
+
+* Linear jobs
+
+.code code/job/job.go /STRUCT_START OMIT/,/STRUCT_END OMIT/
+
+When a job finishes successfully, its output is passed on to the input of the following jobs and those jobs are enqueued.
+
+.caption Our jobs are trees, which means they die in the fall
+
+* Linear jobs
+As always, interfaces make life easier
+
+.code code/job/job.go /HANDLER_START OMIT/,/HANDLER_END OMIT/
+
+* Linear jobs
+
+.code code/job/job.go /DOWN_START OMIT/,/DOWN_END OMIT/
+
+* Registering jobs
+
+* Registering jobs
+
+The Go type system makes things like this very easy.
+
+.code code/job/job.go /REGISTER_START OMIT/,/REGISTER_END OMIT/
+
+* Registering jobs
+
+.code code/job/job.go /INIT_START OMIT/,/INIT_END OMIT/
+
+* Small, fast, and cheap
+
+* Small, fast, and cheap
+
+We run on everything on Heroku, so keeping the memory footprint small ensures that we keep our costs down.
+
+For most jobs you won't have any issues, but some things require you to process large amounts of data in some way.
+
+In our example we wanted to download large files, encrypt them, and store them somewhere else. And all of that in only one job*
+
+*this breaks the Unix philosophy, but it was a requirement.
+
+* Small, fast, and cheap
+
+`io`
+
+* Small, fast, and cheap
+
+First we get a response containing the *Body* `io.ReadCloser`
+.code code/piping/piping.go /RESP_START/,/RESP_END/
+
+We open up a pipe, which is a great way to connect an `io.Reader` with an `io.Writer`
+Keep in mind that the pipe is *synchronous!*
+.code code/piping/piping.go /PIPE_START/,/PIPE_END/
+
+* Small, fast, and cheap
+
+A small wrapper function that does all the necessary encryption stuff, returns an `io.WriteCloser`
+.code code/piping/piping.go /ENCRY_START/,/ENCRY_END/
+
+And we start the copying process.
+.code code/piping/piping.go /FINISH_START/,/FINISH_END/
+
+* Small, fast, and cheap
+
+`resp.Body()` ➡
+`io.WriteCloser` ➡
+`io.PipeWriter` ➡
+`io.PipeReader` ➡
+`http.Post()`
+
+* ActiveJob headaches
+
+* ActiveJob headaches
+
+When you want to do everything, some specific things are bound to break.
+
+Resque hook:
+
+  # Given an object, returns a list `around_perform` hook names.
+  def around_hooks(job)
+    get_hook_names(job, 'around_perform')
+  end
+
+  # Given an object, and a method prefix, returns a list of methods prefixed
+  # with that name (hook names).
+  def get_hook_names(job, hook_method_prefix)
+    methods = (job.respond_to?(:hooks) && job.hooks) || job_methods(job)
+    methods.select{|m| m.start_with?(hook_method_prefix)}.sort
+  end
+
+* ActiveJob headaches
+
+ActiveJob hook:
+
+    # Defines a callback that will get called around the job's perform method.
+    def around_perform(*filters, &blk)
+       set_callback(:perform, :around, *filters, &blk)
+    end
+
+* ActiveJob headaches
+
+Our jobs are subclasses of `ActiveJob`, which expects your `around_perform` hook to call the block passed to `perform`.
+
+Resque expects your `around_perform` hook to yield for a job to `perform`.
+Resque also looks for hooks using string matching.
+
+* ActiveJob headaches
+
+So what happens?
+
+We enqueue a standard Resque job from Go, which a Resque worker finds. That Resque worker finds all methods with the name `around_perform` and calls them.
+
+The `around_perform` that gets called first is the ActiveJob `around_perform`, which never calls the passed in block, and never yields.
+
+That means our job will be removed from the queue, but the the job itself will never run.
+
+* ActiveJob headaches
+
+And our beautiful fix:
+
+  def self.perform(*args)
+    n = new
+    n.arguments.append(args.first.to_json)
+    n.perform_now
+  end
+
+  def self.around_perform(*args)
+    yield(*args)
+  end
+
+* Questions?
